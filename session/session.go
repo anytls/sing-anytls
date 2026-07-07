@@ -382,6 +382,19 @@ func (s *Session) writeDataFrame(sid uint32, data []byte) (int, error) {
 	if dataLen == 0 {
 		return 0, nil
 	}
+	if dataLen <= maxFrameDataLen {
+		buffer := buf.NewSize(dataLen + headerOverHeadSize)
+		buffer.WriteByte(cmdPSH)
+		binary.BigEndian.PutUint32(buffer.Extend(4), sid)
+		binary.BigEndian.PutUint16(buffer.Extend(2), uint16(dataLen))
+		buffer.Write(data)
+		_, err := s.writeConn(buffer.Bytes())
+		buffer.Release()
+		if err != nil {
+			return 0, err
+		}
+		return dataLen, nil
+	}
 
 	frameCount := (dataLen + maxFrameDataLen - 1) / maxFrameDataLen
 	buffer := buf.NewSize(dataLen + frameCount*headerOverHeadSize)

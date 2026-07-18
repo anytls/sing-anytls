@@ -1,3 +1,3 @@
 package util
 
-var Verison = "sing-anytls/0.0.12"
+var Version = "sing-anytls/0.0.13"

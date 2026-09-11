@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/anytls/sing-anytls/padding"
 	"github.com/anytls/sing-anytls/session"
@@ -26,6 +27,9 @@ type Service struct {
 	handler         N.TCPConnectionHandlerEx
 	fallbackHandler N.TCPConnectionHandlerEx
 	logger          logger.ContextLogger
+
+	sessionAccess sync.Mutex
+	sessions      map[*session.Session]string
 }
 
 type ServiceConfig struct {
@@ -47,6 +51,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 		fallbackHandler: config.FallbackHandler,
 		logger:          config.Logger,
 		users:           make(map[[32]byte]string),
+		sessions:        make(map[*session.Session]string),
 	}
 
 	if service.handler == nil || service.logger == nil {
@@ -70,6 +75,47 @@ func (s *Service) UpdateUsers(users []User) {
 		u[sha256.Sum256([]byte(user.Password))] = user.Name
 	}
 	s.users = u
+	s.closeRemovedSessions(users)
+}
+
+// trackSession registers an authenticated session, so that a later UpdateUsers
+// can revoke it.
+func (s *Service) trackSession(userSession *session.Session, user string) {
+	s.sessionAccess.Lock()
+	defer s.sessionAccess.Unlock()
+	s.sessions[userSession] = user
+}
+
+func (s *Service) untrackSession(userSession *session.Session) {
+	s.sessionAccess.Lock()
+	defer s.sessionAccess.Unlock()
+	delete(s.sessions, userSession)
+}
+
+// closeRemovedSessions closes the sessions of users that are gone from the new
+// user table. A connection is authenticated once, by the password hash that
+// opens it, and then carries any number of streams without that password being
+// looked at again, so dropping a user from the table does not by itself revoke
+// the access that user already has.
+//
+// Victims are collected under the lock and closed after it is released, so that
+// Session.Close never runs with the session lock held.
+func (s *Service) closeRemovedSessions(users []User) {
+	names := make(map[string]struct{}, len(users))
+	for _, user := range users {
+		names[user.Name] = struct{}{}
+	}
+	s.sessionAccess.Lock()
+	var removed []*session.Session
+	for userSession, user := range s.sessions {
+		if _, stillValid := names[user]; !stillValid {
+			removed = append(removed, userSession)
+		}
+	}
+	s.sessionAccess.Unlock()
+	for _, userSession := range removed {
+		userSession.Close()
+	}
 }
 
 // NewConnection `conn` should be plaintext
@@ -90,12 +136,12 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 	}
 	var passwordSha256 [32]byte
 	copy(passwordSha256[:], by)
-	if user, ok := s.users[passwordSha256]; ok {
-		ctx = auth.ContextWithUser(ctx, user)
-	} else {
+	user, loaded := s.users[passwordSha256]
+	if !loaded {
 		b.Resize(0, n)
 		return s.fallback(ctx, conn, source, E.New("unknown user password"), onClose)
 	}
+	ctx = auth.ContextWithUser(ctx, user)
 	by, err = b.ReadBytes(2)
 	if err != nil {
 		b.Resize(0, n)
@@ -119,6 +165,8 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 
 		s.handler.NewConnectionEx(ctx, stream, source, destination, onClose)
 	}, &s.padding, s.logger)
+	s.trackSession(session, user)
+	defer s.untrackSession(session)
 	session.Run()
 	session.Close()
 	return nil
